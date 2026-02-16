@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 from collectors.binance_collector import BinanceCollector
+from collectors.polymarket_collector import PolymarketCLOB
 from collectors.polyscan_collector import PolyscanClient
 from storage.db import DB
 from trading.arena_trader import ArenaTrader
@@ -139,6 +140,23 @@ class App:
         self.cfg = cfg
         self.mode = cfg["env"]["mode"]
 
+        # DB
+        self.db = DB(path=cfg["storage"]["db_path"], schema_path=cfg["storage"]["schema_path"])
+
+        self.binance = BinanceCollector(**cfg["binance"])
+        self.polymarket = PolymarketCLOB()
+        self.polyscan = PolyscanClient(
+            base_url=cfg["polyscan"]["base_url"],
+            agent_id=cfg["polyscan"]["agent_id"],
+            timeout_s=cfg["polyscan"]["timeout_seconds"],
+            cache_ttl_markets_s=cfg["polyscan"]["cache_ttl_markets_seconds"],
+            cache_ttl_market_detail_s=cfg["polyscan"]["cache_ttl_market_detail_seconds"],
+        )
+        self.arena = ArenaTrader(
+            base_url=cfg["polyscan"]["base_url"],
+            agent_id=cfg["polyscan"]["agent_id"],
+            timeout_s=cfg["polyscan"]["timeout_seconds"],
+        )
         self.binance = BinanceCollector()
         self.polyscan = PolyscanClient()
         self.arena = ArenaTrader()
@@ -172,6 +190,12 @@ class App:
         limit = int(cfg["budget"]["max_watchlist_markets"]) * 3
         elig = cfg["watchlist"]["eligibility"]
 
+        try:
+            category = self.cfg["watchlist"]["categories"][0] if self.cfg["watchlist"]["categories"] else "crypto"
+            candidates = await self.polyscan.list_markets(category=category, limit=100)
+        except Exception as e:
+            print(f"[WATCHLIST] polyscan.search failed: {e}")
+            return
         raw = await self.polyscan.list_markets(category=cat, limit=limit, sort="created_at", order="desc")
 
         rows: List[MarketRow] = []
@@ -403,6 +427,21 @@ class App:
                 fair_value=None,
             )
 
+        try:
+            whales = await self.polyscan.whales(limit=200)
+        except Exception as e:
+            print(f"[WHALES] fetch failed: {e}")
+            return candidates
+
+        whales = [w for w in whales if int(w.get("ts") or 0) >= since]
+
+        # Index whales by market for quick lookup
+        whales_by_market: Dict[str, List[Dict[str, Any]]] = {}
+        for w in whales:
+            m = w.get("market_id")
+            if not m:
+                continue
+            whales_by_market.setdefault(m, []).append(w)
             portfolio2 = await self.get_portfolio_cached(ttl_seconds=0)
             portfolio_value = portfolio2.get("portfolio_value")
 
@@ -475,6 +514,33 @@ class App:
                 if not d:
                     continue
 
+        # Record entry trade and snapshot
+        self.db.record_trade(
+            trade_id=trade_id,
+            ts_entry=ts_entry,
+            mode=self.mode,
+            strategy=c.strategy,
+            market_id=c.market_id,
+            side=c.side,
+            qty=c.qty,
+            price_entry=c.price_ref,
+            fees_estimated=c.cost_cents_est / 100.0,  # placeholder conversion
+            notes=json.dumps(c.meta),
+        )
+        self.db.record_trade_snapshot(
+            trade_id=trade_id,
+            ts=ts_entry,
+            phase="ENTRY",
+            binance_price=c.meta.get("binance_price"),
+            yes_price=c.price_ref,
+            no_price=max(0.0, 1.0 - c.price_ref),
+            liquidity_usd=c.liquidity_usd,
+            edge_est=c.edge_cents_est,
+            current_price=c.price_ref,
+            avg_price=c.price_ref,
+            market_value=c.qty * c.price_ref,
+            extra=json.dumps({"spread_cents": c.spread_cents, "cost_cents_est": c.cost_cents_est, "stale_seconds": c.stale_seconds}),
+        )
                 trade_id = await self.execute_entry(d)
                 if trade_id:
                     self._entry_ts_by_trade[trade_id] = now_ts()
@@ -496,6 +562,50 @@ class App:
             except Exception as e:
                 print(f"[MONITOR] error: {e}")
 
+    async def exit_position(self, pos: Position, exit_reason: str) -> bool:
+        ts_exit = now_ts()
+        mid = await self.polymarket.get_midpoint(pos.market_id)
+        if mid is None:
+            # count as exit failure
+            self.kill.trigger_pause("Exit failed: no midpoint")
+            return False
+
+        # Simulated exit at midpoint
+        pnl = (mid - pos.entry_price) * pos.qty if pos.side == "YES" else (pos.entry_price - mid) * pos.qty
+
+        self.db.record_trade(
+            trade_id=pos.trade_id,
+            ts_exit=ts_exit,
+            price_exit=mid,
+            pnl=pnl,
+            outcome="WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "FLAT"),
+            exit_reason=exit_reason,
+        )
+        self.db.record_trade_snapshot(
+            trade_id=pos.trade_id,
+            ts=ts_exit,
+            phase="EXIT",
+            binance_price=None,
+            yes_price=mid,
+            no_price=max(0.0, 1.0 - mid),
+            liquidity_usd=None,
+            edge_est=None,
+            unrealized_pnl=0.0,
+            current_price=mid,
+            avg_price=pos.entry_price,
+            market_value=mid * pos.qty,
+            extra=json.dumps({"exit_reason": exit_reason}),
+        )
+        print(f"[TRADE] Exited {pos.trade_id} reason={exit_reason} @ {mid:.2f} pnl={pnl:.4f}")
+        return True
+
+    def request_shutdown(self) -> None:
+        self._shutdown = True
+
+
+# -----------------------------
+# Entrypoint
+# -----------------------------
 
 async def main_async() -> None:
     cfg = load_config("config/config.yaml")

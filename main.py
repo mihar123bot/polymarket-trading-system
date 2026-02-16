@@ -32,6 +32,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from collectors.binance_collector import BinanceCollector
+from collectors.polymarket_collector import PolymarketCLOB
+from collectors.polyscan_collector import PolyscanClient
+from storage.db import DB
+from trading.arena_trader import ArenaTrader
+
 
 # -----------------------------
 # Utilities
@@ -74,99 +80,6 @@ class Position:
     target_edge_cents: float
     max_hold_seconds: int
     meta: Dict[str, Any]
-
-
-# -----------------------------
-# Placeholder interfaces
-# (Codex should wire to your actual modules)
-# -----------------------------
-
-class DB:
-    """storage/db.py wrapper (placeholder)."""
-
-    def __init__(self, db_path: str = "storage/polymarket.db"):
-        self.db_path = db_path
-
-    def init_schema(self) -> None:
-        # Implement: execute schema.sql or create tables via SQL
-        pass
-
-    def upsert_market(self, market_id: str, title: str, category: str, source: str) -> None:
-        pass
-
-    def record_watchlist_event(self, market_id: str, action: str, reason: str) -> None:
-        pass
-
-    def record_trade(self, **kwargs) -> None:
-        pass
-
-    def record_trade_snapshot(self, **kwargs) -> None:
-        pass
-
-    def record_whale_touch(self, **kwargs) -> None:
-        pass
-
-    def record_daily_metrics(self, **kwargs) -> None:
-        pass
-
-    def get_today_trade_count(self, mode: str) -> int:
-        return 0
-
-    def get_exit_failure_count_today(self, mode: str) -> int:
-        return 0
-
-    def compute_daily_rollup(self, day: str, mode: str) -> Dict[str, Any]:
-        return {}
-
-
-class BinanceCollector:
-    """collectors/binance_collector.py wrapper (placeholder)."""
-
-    async def stream_ticks(self):
-        """
-        Yields dicts like:
-          {"ts": int, "price": float}
-        """
-        raise NotImplementedError
-
-
-class PolymarketCLOB:
-    """collectors/polymarket_collector.py wrapper (placeholder)."""
-
-    async def get_midpoint(self, market_id: str) -> Optional[float]:
-        raise NotImplementedError
-
-    async def get_top_of_book(self, market_id: str) -> Optional[Dict[str, float]]:
-        """
-        Return:
-          {"best_bid": float, "best_ask": float}
-        """
-        raise NotImplementedError
-
-
-class PolyscanClient:
-    """collectors/polyscan_collector.py wrapper (placeholder)."""
-
-    async def search_markets(self, keywords: List[str], limit: int = 50) -> List[Dict[str, Any]]:
-        """
-        Return list of markets with at least:
-          {"market_id": str, "title": str}
-        """
-        raise NotImplementedError
-
-    async def market_detail(self, market_id: str) -> Dict[str, Any]:
-        """
-        Return microstructure:
-          {"liquidity_usd": float, "spread_cents": float, ...}
-        """
-        raise NotImplementedError
-
-    async def recent_whales(self, since_ts: int) -> List[Dict[str, Any]]:
-        """
-        Return whale trades:
-          {"market_id": str, "wallet": str, "side": str, "amount_usd": float, "tier": str, "anomaly_tags": [...]} 
-        """
-        raise NotImplementedError
 
 
 class EventDetector:
@@ -271,12 +184,22 @@ class App:
         self.mode = cfg["env"]["mode"]
 
         # DB
-        self.db = DB()
+        self.db = DB(path=cfg["storage"]["db_path"], schema_path=cfg["storage"]["schema_path"])
 
-        # Collectors / clients (Codex: instantiate real versions)
-        self.binance = BinanceCollector()
+        self.binance = BinanceCollector(**cfg["binance"])
         self.polymarket = PolymarketCLOB()
-        self.polyscan = PolyscanClient()
+        self.polyscan = PolyscanClient(
+            base_url=cfg["polyscan"]["base_url"],
+            agent_id=cfg["polyscan"]["agent_id"],
+            timeout_s=cfg["polyscan"]["timeout_seconds"],
+            cache_ttl_markets_s=cfg["polyscan"]["cache_ttl_markets_seconds"],
+            cache_ttl_market_detail_s=cfg["polyscan"]["cache_ttl_market_detail_seconds"],
+        )
+        self.arena = ArenaTrader(
+            base_url=cfg["polyscan"]["base_url"],
+            agent_id=cfg["polyscan"]["agent_id"],
+            timeout_s=cfg["polyscan"]["timeout_seconds"],
+        )
 
         # State
         self.watchlist = Watchlist(max_size=cfg["budget"]["max_watchlist_markets"])
@@ -309,7 +232,8 @@ class App:
         elig = self.cfg["watchlist"]["eligibility"]
 
         try:
-            candidates = await self.polyscan.search_markets(keywords=keywords, limit=100)
+            category = self.cfg["watchlist"]["categories"][0] if self.cfg["watchlist"]["categories"] else "crypto"
+            candidates = await self.polyscan.list_markets(category=category, limit=100)
         except Exception as e:
             print(f"[WATCHLIST] polyscan.search failed: {e}")
             return
@@ -491,10 +415,12 @@ class App:
         since = now_ts() - int(whales_cfg["confirm_window_seconds"])
 
         try:
-            whales = await self.polyscan.recent_whales(since_ts=since)
+            whales = await self.polyscan.whales(limit=200)
         except Exception as e:
             print(f"[WHALES] fetch failed: {e}")
             return candidates
+
+        whales = [w for w in whales if int(w.get("ts") or 0) >= since]
 
         # Index whales by market for quick lookup
         whales_by_market: Dict[str, List[Dict[str, Any]]] = {}
@@ -580,14 +506,14 @@ class App:
             ts=ts_entry,
             phase="ENTRY",
             binance_price=c.meta.get("binance_price"),
-            polymarket_mid=c.price_ref,
-            best_bid=c.price_ref - (c.spread_cents / 2.0),
-            best_ask=c.price_ref + (c.spread_cents / 2.0),
-            spread_cents=c.spread_cents,
+            yes_price=c.price_ref,
+            no_price=max(0.0, 1.0 - c.price_ref),
             liquidity_usd=c.liquidity_usd,
-            stale_seconds=c.stale_seconds,
-            edge_cents_est=c.edge_cents_est,
-            cost_cents_est=c.cost_cents_est,
+            edge_est=c.edge_cents_est,
+            current_price=c.price_ref,
+            avg_price=c.price_ref,
+            market_value=c.qty * c.price_ref,
+            extra=json.dumps({"spread_cents": c.spread_cents, "cost_cents_est": c.cost_cents_est, "stale_seconds": c.stale_seconds}),
         )
 
         # Paper / Arena / Live execution is abstracted.
@@ -674,14 +600,15 @@ class App:
             ts=ts_exit,
             phase="EXIT",
             binance_price=None,
-            polymarket_mid=mid,
-            best_bid=None,
-            best_ask=None,
-            spread_cents=None,
+            yes_price=mid,
+            no_price=max(0.0, 1.0 - mid),
             liquidity_usd=None,
-            stale_seconds=None,
-            edge_cents_est=None,
-            cost_cents_est=None,
+            edge_est=None,
+            unrealized_pnl=0.0,
+            current_price=mid,
+            avg_price=pos.entry_price,
+            market_value=mid * pos.qty,
+            extra=json.dumps({"exit_reason": exit_reason}),
         )
         print(f"[TRADE] Exited {pos.trade_id} reason={exit_reason} @ {mid:.2f} pnl={pnl:.4f}")
         return True

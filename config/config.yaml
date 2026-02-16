@@ -1,0 +1,57 @@
+env:
+  mode: arena
+
+binance:
+  symbol: BTCUSDT
+  poll_seconds: 1.0
+  price_seed: 60000.0
+
+watchlist:
+  categories: ["crypto"]
+  market_search:
+    keywords: ["bitcoin", "btc"]
+    refresh_seconds: 60
+  eligibility:
+    min_liquidity_usd: 5000
+    max_spread_cents: 5
+    max_position_pct_of_liquidity: 0.02
+
+signals:
+  latency:
+    window_seconds: 10
+    trigger_bps: 20
+    stale_price_seconds: 2
+    confidence_min: 0.5
+  whales:
+    enabled: false
+    confirm_window_seconds: 120
+    tier_allowlist: ["gold", "silver"]
+    min_amount_usd: 5000
+
+risk:
+  kill_switch:
+    max_consecutive_exit_failures: 3
+    max_daily_drawdown_pct: 5
+    pause_minutes_on_trigger: 15
+
+budget:
+  max_watchlist_markets: 10
+  max_trades_per_day: 50
+
+fees:
+  fallback_taker_fee_rate: 0.02
+
+execution:
+  slippage_buffer_cents: 0.2
+  min_edge_after_costs_cents: 1.0
+
+polyscan:
+  base_url: "https://gzydspfquuaudqeztorw.supabase.co/functions/v1/agent-api"
+  agent_id: "PaperTradingCo"
+  timeout_seconds: 15
+  cache_ttl_markets_seconds: 15
+  cache_ttl_market_detail_seconds: 10
+
+storage:
+  db_path: "storage/polymarket.db"
+  schema_path: "storage/schema.sql"

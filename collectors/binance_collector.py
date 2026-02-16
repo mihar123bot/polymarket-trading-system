@@ -17,3 +17,5 @@ class BinanceCollector:
         while True:
             await asyncio.sleep(self.poll_seconds)
             yield {"ts": int(time.time()), "price": self.price}
+    async def stream_ticks(self) -> AsyncIterator[Dict[str, Any]]:
+        raise NotImplementedError("Implement Binance websocket stream in collectors/binance_collector.py")

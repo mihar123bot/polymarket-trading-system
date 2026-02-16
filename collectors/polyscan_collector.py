@@ -125,6 +125,10 @@ class PolyscanClient:
         except Exception:
             return default
 
+from typing import Any, Dict, List
+
+
+class PolyscanClient:
     async def list_markets(
         self,
         category: str,
@@ -219,3 +223,5 @@ class PolyscanClient:
     async def ai_vs_humans(self, limit: int = 50) -> List[Dict[str, Any]]:
         data = await self._get_json({"action": "ai-vs-humans", "limit": int(limit)})
         return data.get("data", []) or []
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError("Implement Polyscan action=markets client in collectors/polyscan_collector.py")

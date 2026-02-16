@@ -1,0 +1,28 @@
+env:
+  mode: "arena"
+
+signals:
+  latency:
+    window_seconds: 10
+    trigger_bps: 5
+
+budget:
+  max_watchlist_markets: 8
+  max_trades_per_day: 50
+
+execution:
+  default_buy_usd: 1
+  max_buy_usd: 10
+  take_profit_usd: 0.05
+  stop_loss_usd: 0.05
+  max_hold_seconds: 120
+
+watchlist:
+  market_search:
+    refresh_seconds: 15
+  eligibility:
+    min_liquidity_usd: 8000
+    min_seconds_to_close: 120
+
+monitoring:
+  poll_seconds: 2

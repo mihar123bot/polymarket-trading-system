@@ -1,23 +1,25 @@
 """
-Lean, one-man Polymarket arb loop (event-driven, low API calls).
-- Binance WS drives opportunity scans
-- Polymarket CLOB read-only used for quotes/books on a small watchlist
-- PolymarketScan (Polyscan) is confirmatory + watchlist refresh, behind circuit breaker + rate limiter
-- No LLM calls in the hot path
+Arena-native PolymarketScan trading loop (one-man shop, low resources).
 
-Repo layout assumed (from your plan):
+Key design (validated from your curl payloads):
+- Arena place_order(BUY) uses amount = USD cost and returns shares + price; fills immediately.
+- Arena place_order(SELL) uses amount = shares to sell.
+- my_portfolio is the source of truth for positions + current_price + unrealized_pnl + recent_orders (includes UUID).
+- Polyscan "markets" feed is used for watchlist discovery (created_at desc), and for selecting trade targets.
+- Binance WS drives "latency" triggers (world-price moves).
+- No Polymarket CLOB calls required.
+
+Repo layout expected:
   collectors/
     binance_collector.py
-    polymarket_collector.py
     polyscan_collector.py
+  trading/
+    arena_trader.py
   storage/
     db.py
-  core/
-    event_detector.py
-    lag_analyzer.py
-    market_scanner.py
-  risk/
-    kill_switch.py
+  config/config.yaml
+
+This file is intentionally MVP-lean.
 """
 
 from __future__ import annotations
@@ -32,9 +34,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from collectors.binance_collector import BinanceCollector
+from collectors.polyscan_collector import PolyscanClient
+from storage.db import DB
+from trading.arena_trader import ArenaTrader
+
 
 # -----------------------------
-# Utilities
+# Utils
 # -----------------------------
 
 def now_ts() -> int:
@@ -46,140 +53,57 @@ def load_config(path: str = "config/config.yaml") -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
+def parse_iso_to_ts(iso_str: str) -> int:
+    """
+    Minimal ISO8601 -> epoch seconds.
+    Avoid heavy deps; handles '2026-02-17T09:25:00+00:00'.
+    """
+    import datetime as dt
+
+    return int(dt.datetime.fromisoformat(iso_str).timestamp())
+
+
+# -----------------------------
+# Data models
+# -----------------------------
+
 @dataclass
-class TradeCandidate:
+class MarketRow:
     market_id: str
-    side: str                      # "YES"/"NO" (or mapped "UP"/"DOWN")
-    qty: float
-    price_ref: float               # reference midpoint at decision time
-    score: float
-    edge_cents_est: float
-    cost_cents_est: float
+    slug: str
+    title: str
+    category: str
+    yes_price: float
+    no_price: float
     liquidity_usd: float
-    spread_cents: float
-    stale_seconds: float
-    strategy: str                  # e.g. "latency" or "latency+whale"
-    meta: Dict[str, Any]
+    volume_usd: float
+    closes_at_iso: str
+    closes_at_ts: int
+    is_resolved: bool
 
 
 @dataclass
-class Position:
-    trade_id: str
-    market_id: str
+class EntryDecision:
+    market: MarketRow
     side: str
-    qty: float
-    entry_price: float
-    ts_entry: int
-    strategy: str
-    target_edge_cents: float
-    max_hold_seconds: int
+    usd: float
+    fair_value: Optional[float]
+    reason: str
     meta: Dict[str, Any]
 
 
 # -----------------------------
-# Placeholder interfaces
-# (Codex should wire to your actual modules)
+# Core helpers
 # -----------------------------
-
-class DB:
-    """storage/db.py wrapper (placeholder)."""
-
-    def __init__(self, db_path: str = "storage/polymarket.db"):
-        self.db_path = db_path
-
-    def init_schema(self) -> None:
-        # Implement: execute schema.sql or create tables via SQL
-        pass
-
-    def upsert_market(self, market_id: str, title: str, category: str, source: str) -> None:
-        pass
-
-    def record_watchlist_event(self, market_id: str, action: str, reason: str) -> None:
-        pass
-
-    def record_trade(self, **kwargs) -> None:
-        pass
-
-    def record_trade_snapshot(self, **kwargs) -> None:
-        pass
-
-    def record_whale_touch(self, **kwargs) -> None:
-        pass
-
-    def record_daily_metrics(self, **kwargs) -> None:
-        pass
-
-    def get_today_trade_count(self, mode: str) -> int:
-        return 0
-
-    def get_exit_failure_count_today(self, mode: str) -> int:
-        return 0
-
-    def compute_daily_rollup(self, day: str, mode: str) -> Dict[str, Any]:
-        return {}
-
-
-class BinanceCollector:
-    """collectors/binance_collector.py wrapper (placeholder)."""
-
-    async def stream_ticks(self):
-        """
-        Yields dicts like:
-          {"ts": int, "price": float}
-        """
-        raise NotImplementedError
-
-
-class PolymarketCLOB:
-    """collectors/polymarket_collector.py wrapper (placeholder)."""
-
-    async def get_midpoint(self, market_id: str) -> Optional[float]:
-        raise NotImplementedError
-
-    async def get_top_of_book(self, market_id: str) -> Optional[Dict[str, float]]:
-        """
-        Return:
-          {"best_bid": float, "best_ask": float}
-        """
-        raise NotImplementedError
-
-
-class PolyscanClient:
-    """collectors/polyscan_collector.py wrapper (placeholder)."""
-
-    async def search_markets(self, keywords: List[str], limit: int = 50) -> List[Dict[str, Any]]:
-        """
-        Return list of markets with at least:
-          {"market_id": str, "title": str}
-        """
-        raise NotImplementedError
-
-    async def market_detail(self, market_id: str) -> Dict[str, Any]:
-        """
-        Return microstructure:
-          {"liquidity_usd": float, "spread_cents": float, ...}
-        """
-        raise NotImplementedError
-
-    async def recent_whales(self, since_ts: int) -> List[Dict[str, Any]]:
-        """
-        Return whale trades:
-          {"market_id": str, "wallet": str, "side": str, "amount_usd": float, "tier": str, "anomaly_tags": [...]} 
-        """
-        raise NotImplementedError
-
 
 class EventDetector:
-    """core/event_detector.py wrapper (placeholder)."""
+    """Simple rolling window detector for bps move in window_seconds."""
 
     def __init__(self, window_seconds: int):
         self.window_seconds = window_seconds
         self._window: List[Tuple[int, float]] = []
 
     def update(self, ts: int, price: float) -> float:
-        """
-        Updates price window and returns bps move from oldest to newest in window.
-        """
         self._window.append((ts, price))
         cutoff = ts - self.window_seconds
         while self._window and self._window[0][0] < cutoff:
@@ -190,79 +114,24 @@ class EventDetector:
         newest = self._window[-1][1]
         if oldest <= 0:
             return 0.0
-        return ((newest - oldest) / oldest) * 10000.0  # bps
+        return ((newest - oldest) / oldest) * 10000.0
 
 
-class KillSwitch:
-    """risk/kill_switch.py wrapper (placeholder)."""
-
-    def __init__(self, max_consecutive_exit_failures: int, max_daily_drawdown_pct: float, pause_minutes: int):
-        self.max_consecutive_exit_failures = max_consecutive_exit_failures
-        self.max_daily_drawdown_pct = max_daily_drawdown_pct
-        self.pause_minutes = pause_minutes
-        self.pause_until_ts: int = 0
-
-    def is_paused(self) -> bool:
-        return now_ts() < self.pause_until_ts
-
-    def trigger_pause(self, reason: str) -> None:
-        self.pause_until_ts = now_ts() + self.pause_minutes * 60
-        print(f"[KILL_SWITCH] Pausing for {self.pause_minutes}m. Reason: {reason}")
-
-
-# -----------------------------
-# Core logic helpers
-# -----------------------------
-
-def estimate_costs_cents(
-    price_mid: float,
-    best_bid: float,
-    best_ask: float,
-    fee_rate: float,
-    slippage_buffer_cents: float,
-) -> Tuple[float, float]:
+def choose_side_for_updown(move_bps: float) -> str:
     """
-    Returns (spread_cents, cost_cents_est).
-    Price units assumed in "cents" probability pricing for YES shares (0-100).
-    If you use 0-1 pricing, adjust conversions consistently.
+    For 'Up or Down' style markets:
+      - If Binance moved up in window: buy YES
+      - If moved down: buy NO
     """
-    spread = max(0.0, (best_ask - best_bid))
-    # Conservative cost estimate: fees proportional to notional + half-spread + slippage buffer
-    # For probability-style markets, notional depends on qty; we treat per-share cents for a minimal gate.
-    # Codex: refine using actual Polymarket fee model once you have it per market.
-    cost = (spread) + slippage_buffer_cents + (price_mid * fee_rate)
-    return spread, cost
-
-
-def choose_side_from_binance_move(move_bps: float) -> str:
-    # Map direction: Binance up => YES on "Up" market; Binance down => YES on "Down" market
-    # Here we just return "YES" vs "NO" placeholder. Codex should map to the market's actual outcomes.
     return "YES" if move_bps > 0 else "NO"
 
 
-# -----------------------------
-# Watchlist manager
-# -----------------------------
-
-class Watchlist:
-    def __init__(self, max_size: int):
-        self.max_size = max_size
-        self.market_ids: List[str] = []
-        self.meta: Dict[str, Dict[str, Any]] = {}  # market_id -> metadata (title/category/liquidity/spread cache)
-
-    def set(self, market_rows: List[Dict[str, Any]]) -> None:
-        self.market_ids = [m["market_id"] for m in market_rows][: self.max_size]
-        self.meta = {m["market_id"]: m for m in market_rows if "market_id" in m}
-
-    def __iter__(self):
-        return iter(self.market_ids)
-
-    def __len__(self):
-        return len(self.market_ids)
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
 # -----------------------------
-# Main Orchestrator
+# App
 # -----------------------------
 
 class App:
@@ -270,112 +139,345 @@ class App:
         self.cfg = cfg
         self.mode = cfg["env"]["mode"]
 
-        # DB
+        self.binance = BinanceCollector()
+        self.polyscan = PolyscanClient()
+        self.arena = ArenaTrader()
         self.db = DB()
 
-        # Collectors / clients (Codex: instantiate real versions)
-        self.binance = BinanceCollector()
-        self.polymarket = PolymarketCLOB()
-        self.polyscan = PolyscanClient()
-
-        # State
-        self.watchlist = Watchlist(max_size=cfg["budget"]["max_watchlist_markets"])
-        self.detector = EventDetector(window_seconds=cfg["signals"]["latency"]["window_seconds"])
-        self.kill = KillSwitch(
-            max_consecutive_exit_failures=cfg["risk"]["kill_switch"]["max_consecutive_exit_failures"],
-            max_daily_drawdown_pct=cfg["risk"]["kill_switch"]["max_daily_drawdown_pct"],
-            pause_minutes=cfg["risk"]["kill_switch"]["pause_minutes_on_trigger"],
-        )
-
-        self.last_polymarket_mid: Dict[str, Tuple[float, int]] = {}  # market_id -> (mid, ts)
-        self.open_positions: Dict[str, Position] = {}               # trade_id -> Position
-
-        # Rate limiting / budgets
+        self.detector = EventDetector(window_seconds=int(cfg["signals"]["latency"]["window_seconds"]))
         self._shutdown = False
-        self._last_watchlist_refresh_ts = 0
+
+        self.watchlist: Dict[str, MarketRow] = {}
+        self._last_watchlist_refresh = 0
+
+        self.open_trade_ids_by_market: Dict[str, str] = {}
+        self._last_portfolio_poll = 0
+        self._cached_portfolio: Optional[Dict[str, Any]] = None
 
     async def init(self) -> None:
         self.db.init_schema()
         await self.refresh_watchlist(force=True)
 
+    def request_shutdown(self) -> None:
+        self._shutdown = True
+
     async def refresh_watchlist(self, force: bool = False) -> None:
-        refresh_seconds = int(self.cfg["watchlist"]["market_search"]["refresh_seconds"])
-        if not force and (now_ts() - self._last_watchlist_refresh_ts) < refresh_seconds:
+        cfg = self.cfg
+        refresh_seconds = int(cfg["watchlist"]["market_search"]["refresh_seconds"])
+        if not force and (now_ts() - self._last_watchlist_refresh) < refresh_seconds:
             return
-        self._last_watchlist_refresh_ts = now_ts()
+        self._last_watchlist_refresh = now_ts()
 
-        keywords = self.cfg["watchlist"]["market_search"]["keywords"]
-        max_markets = self.cfg["budget"]["max_watchlist_markets"]
-        elig = self.cfg["watchlist"]["eligibility"]
+        cat = "Crypto"
+        limit = int(cfg["budget"]["max_watchlist_markets"]) * 3
+        elig = cfg["watchlist"]["eligibility"]
 
-        try:
-            candidates = await self.polyscan.search_markets(keywords=keywords, limit=100)
-        except Exception as e:
-            print(f"[WATCHLIST] polyscan.search failed: {e}")
-            return
+        raw = await self.polyscan.list_markets(category=cat, limit=limit, sort="created_at", order="desc")
 
-        # Filter by microstructure (liquidity/spread) with minimal calls:
-        # - Call market_detail only for top N candidates
-        market_rows: List[Dict[str, Any]] = []
-        for c in candidates[: max_markets * 2]:
-            mid = c.get("market_id")
-            if not mid:
-                continue
+        rows: List[MarketRow] = []
+        now_utc = now_ts()
+        min_seconds_to_close = int(elig.get("min_seconds_to_close", 120))
+
+        for item in raw:
             try:
-                detail = await self.polyscan.market_detail(mid)
+                closes_at_iso = item.get("closes_at")
+                if not closes_at_iso:
+                    continue
+                closes_at_ts = parse_iso_to_ts(closes_at_iso)
+                if closes_at_ts <= (now_utc + min_seconds_to_close):
+                    continue
+                if bool(item.get("is_resolved", False)):
+                    continue
+
+                liquidity = float(item.get("liquidity_usd", 0.0) or 0.0)
+                if liquidity < float(elig["min_liquidity_usd"]):
+                    continue
+
+                title = str(item.get("title", ""))
+                if "Up or Down" not in title and "updown" not in str(item.get("slug", "")):
+                    continue
+
+                row = MarketRow(
+                    market_id=str(item["market_id"]),
+                    slug=str(item.get("slug", "")),
+                    title=title,
+                    category=str(item.get("category", "Crypto")),
+                    yes_price=float(item.get("yes_price", 0.5) or 0.5),
+                    no_price=float(item.get("no_price", 0.5) or 0.5),
+                    liquidity_usd=liquidity,
+                    volume_usd=float(item.get("volume_usd", 0.0) or 0.0),
+                    closes_at_iso=closes_at_iso,
+                    closes_at_ts=closes_at_ts,
+                    is_resolved=bool(item.get("is_resolved", False)),
+                )
+                rows.append(row)
             except Exception:
                 continue
 
-            liquidity = float(detail.get("liquidity_usd", 0.0) or 0.0)
-            spread_cents = float(detail.get("spread_cents", 9999.0) or 9999.0)
+        rows = sorted(rows, key=lambda r: r.closes_at_ts)
+        max_wl = int(cfg["budget"]["max_watchlist_markets"])
+        rows = rows[:max_wl]
 
-            if liquidity < float(elig["min_liquidity_usd"]):
+        new_watchlist: Dict[str, MarketRow] = {r.market_id: r for r in rows}
+
+        old_ids = set(self.watchlist.keys())
+        new_ids = set(new_watchlist.keys())
+        for mid in new_ids - old_ids:
+            self.db.record_watchlist_event(mid, "ADD", "eligibility_passed")
+        for mid in old_ids - new_ids:
+            self.db.record_watchlist_event(mid, "REMOVE", "refresh_rotation")
+
+        for r in rows:
+            self.db.upsert_market(r.market_id, r.title, r.category, source="polyscan", slug=r.slug)
+
+        self.watchlist = new_watchlist
+        print(f"[WATCHLIST] {len(self.watchlist)} markets (filtered)")
+
+    async def get_portfolio_cached(self, ttl_seconds: int = 2) -> Dict[str, Any]:
+        now = now_ts()
+        if self._cached_portfolio is None or (now - self._last_portfolio_poll) >= ttl_seconds:
+            self._cached_portfolio = await self.arena.my_portfolio()
+            self._last_portfolio_poll = now
+        return self._cached_portfolio
+
+    def has_open_position_in_market(self, portfolio: Dict[str, Any], market_id: str) -> bool:
+        positions = portfolio.get("positions", []) or []
+        for p in positions:
+            if str(p.get("market_id")) == str(market_id) and float(p.get("shares", 0.0) or 0.0) > 0:
+                return True
+        return False
+
+    async def decide_entry(self, move_bps: float, binance_price: float) -> Optional[EntryDecision]:
+        cfg = self.cfg
+        latency = cfg["signals"]["latency"]
+        exec_cfg = cfg["execution"]
+        budget = cfg["budget"]
+
+        if abs(move_bps) < float(latency["trigger_bps"]):
+            return None
+
+        if self.db.get_today_trade_count(self.mode) >= int(budget["max_trades_per_day"]):
+            return None
+
+        portfolio = await self.get_portfolio_cached(ttl_seconds=2)
+
+        candidates = list(self.watchlist.values())
+        candidates = [m for m in candidates if "Bitcoin Up or Down" in m.title] or list(self.watchlist.values())
+        candidates = [m for m in candidates if not self.has_open_position_in_market(portfolio, m.market_id)]
+
+        if not candidates:
+            return None
+
+        target = candidates[0]
+
+        side = choose_side_for_updown(move_bps)
+
+        usd = float(exec_cfg.get("default_buy_usd", 1.0))
+        usd = clamp(usd, 1.0, float(exec_cfg.get("max_buy_usd", 25.0)))
+
+        fv = 0.5 + clamp(move_bps / 2000.0, -0.1, 0.1)
+        fv = float(clamp(fv, 0.01, 0.99))
+
+        return EntryDecision(
+            market=target,
+            side=side,
+            usd=usd,
+            fair_value=fv,
+            reason="latency_trigger",
+            meta={
+                "move_bps": move_bps,
+                "binance_price": binance_price,
+                "market_yes_price": target.yes_price,
+                "market_no_price": target.no_price,
+                "closes_at": target.closes_at_iso,
+            },
+        )
+
+    async def execute_entry(self, d: EntryDecision) -> Optional[str]:
+        trade_id = str(uuid.uuid4())
+        ts_entry = now_ts()
+
+        resp = await self.arena.place_order(
+            market_id=d.market.market_id,
+            side=d.side,
+            amount=d.usd,
+            action="BUY",
+            fair_value=d.fair_value,
+        )
+        shares = float(resp["shares"])
+        price = float(resp["price"])
+        cost = float(resp["cost"])
+
+        portfolio = await self.get_portfolio_cached(ttl_seconds=0)
+        recent_orders = portfolio.get("recent_orders", []) or []
+        arena_order_id = None
+        filled_at = None
+        if recent_orders:
+            newest = sorted(recent_orders, key=lambda x: x.get("created_at", ""), reverse=True)[0]
+            arena_order_id = newest.get("id")
+            filled_at = newest.get("filled_at") or newest.get("created_at")
+
+        self.db.record_trade(
+            trade_id=trade_id,
+            ts_entry=ts_entry,
+            mode=self.mode,
+            strategy="latency",
+            market_id=d.market.market_id,
+            side=d.side,
+            qty=shares,
+            price_entry=price,
+            notes=json.dumps({"reason": d.reason, "meta": d.meta}),
+            arena_order_id=arena_order_id,
+            filled_at=filled_at,
+            fees_estimated=0.0,
+        )
+
+        self.db.record_trade_snapshot(
+            trade_id=trade_id,
+            ts=ts_entry,
+            phase="ENTRY",
+            binance_price=d.meta.get("binance_price"),
+            yes_price=d.market.yes_price,
+            no_price=d.market.no_price,
+            liquidity_usd=d.market.liquidity_usd,
+            edge_est=(d.fair_value - (d.market.yes_price if d.side == "YES" else d.market.no_price)) if d.fair_value else None,
+            unrealized_pnl=0.0,
+            portfolio_value=portfolio.get("portfolio_value"),
+        )
+
+        self.open_trade_ids_by_market[d.market.market_id] = trade_id
+
+        print(
+            f"[ENTRY] trade_id={trade_id} arena_order_id={arena_order_id} "
+            f"market={d.market.market_id} side={d.side} cost=${cost:.2f} shares={shares:.4f} px={price:.4f}"
+        )
+        return trade_id
+
+    async def maybe_exit_positions(self) -> None:
+        cfg = self.cfg
+        exec_cfg = cfg["execution"]
+
+        portfolio = await self.get_portfolio_cached(ttl_seconds=0)
+        positions = portfolio.get("positions", []) or []
+
+        take_profit_usd = float(exec_cfg.get("take_profit_usd", 0.05))
+        stop_loss_usd = float(exec_cfg.get("stop_loss_usd", 0.05))
+        max_hold_seconds = int(exec_cfg.get("max_hold_seconds", 120))
+
+        now = now_ts()
+
+        for p in positions:
+            market_id = str(p.get("market_id"))
+            side = str(p.get("side"))
+            shares = float(p.get("shares", 0.0) or 0.0)
+            if shares <= 0:
                 continue
-            if spread_cents > float(elig["max_spread_cents"]):
+
+            trade_id = self.open_trade_ids_by_market.get(market_id)
+            if not trade_id:
                 continue
 
-            row = {
-                "market_id": mid,
-                "title": c.get("title", ""),
-                "category": ",".join(self.cfg["watchlist"]["categories"]),
-                "source": "polyscan",
-                "liquidity_usd": liquidity,
-                "spread_cents": spread_cents,
-            }
-            market_rows.append(row)
+            unreal = float(p.get("unrealized_pnl", 0.0) or 0.0)
+            current_price = float(p.get("current_price", 0.0) or 0.0)
+            avg_price = float(p.get("avg_price", 0.0) or 0.0)
 
-        market_rows = sorted(market_rows, key=lambda r: r.get("liquidity_usd", 0.0), reverse=True)[:max_markets]
-        self.watchlist.set(market_rows)
+            ts_entry = self._entry_ts_by_trade.get(trade_id)
+            age = (now - ts_entry) if ts_entry else 0
 
-        for r in market_rows:
-            self.db.upsert_market(r["market_id"], r.get("title", ""), r.get("category", ""), r.get("source", "polyscan"))
+            exit_reason = None
+            if unreal >= take_profit_usd:
+                exit_reason = "target"
+            elif unreal <= -stop_loss_usd:
+                exit_reason = "stop"
+            elif ts_entry and age >= max_hold_seconds:
+                exit_reason = "timeout"
 
-        print(f"[WATCHLIST] refreshed: {len(self.watchlist)} markets")
+            if not exit_reason:
+                continue
+
+            sell_resp = await self.arena.place_order(
+                market_id=market_id,
+                side=side,
+                amount=shares,
+                action="SELL",
+                fair_value=None,
+            )
+
+            portfolio2 = await self.get_portfolio_cached(ttl_seconds=0)
+            portfolio_value = portfolio2.get("portfolio_value")
+
+            sell_price = float(sell_resp.get("price", current_price) or current_price)
+            realized = (sell_price - avg_price) * shares
+
+            arena_order_id = None
+            filled_at = None
+            ro2 = portfolio2.get("recent_orders", []) or []
+            if ro2:
+                newest2 = sorted(ro2, key=lambda x: x.get("created_at", ""), reverse=True)[0]
+                arena_order_id = newest2.get("id")
+                filled_at = newest2.get("filled_at") or newest2.get("created_at")
+
+            self.db.record_trade(
+                trade_id=trade_id,
+                ts_exit=now_ts(),
+                price_exit=sell_price,
+                pnl=realized,
+                outcome="WIN" if realized > 0 else ("LOSS" if realized < 0 else "FLAT"),
+                exit_reason=exit_reason,
+                arena_exit_order_id=arena_order_id,
+                exit_filled_at=filled_at,
+            )
+
+            self.db.record_trade_snapshot(
+                trade_id=trade_id,
+                ts=now_ts(),
+                phase="EXIT",
+                binance_price=None,
+                yes_price=None,
+                no_price=None,
+                liquidity_usd=None,
+                edge_est=None,
+                unrealized_pnl=0.0,
+                portfolio_value=portfolio_value,
+                current_price=sell_price,
+                avg_price=avg_price,
+                market_value=0.0,
+            )
+
+            self.open_trade_ids_by_market.pop(market_id, None)
+            self._entry_ts_by_trade.pop(trade_id, None)
+
+            print(
+                f"[EXIT] trade_id={trade_id} reason={exit_reason} "
+                f"market={market_id} side={side} shares={shares:.4f} sell_px={sell_price:.4f} realized={realized:.4f}"
+            )
 
     async def run(self) -> None:
-        # Background task: monitor open positions
-        monitor_task = asyncio.create_task(self.position_monitor_loop())
+        if self.mode != "arena":
+            print(f"[WARN] env.mode is '{self.mode}'. This main.py is Arena-native; set env.mode: arena")
 
-        # Main event loop: Binance tick stream
+        self._entry_ts_by_trade: Dict[str, int] = {}
+
+        monitor_task = asyncio.create_task(self.monitor_loop())
+
         try:
             async for tick in self.binance.stream_ticks():
                 if self._shutdown:
                     break
 
-                if self.kill.is_paused():
-                    continue
-
                 ts = int(tick["ts"])
                 price = float(tick["price"])
                 move_bps = self.detector.update(ts, price)
 
-                # Periodic watchlist refresh (low cadence)
                 await self.refresh_watchlist(force=False)
 
-                # Trigger scan only when move is meaningful
-                latency_cfg = self.cfg["signals"]["latency"]
-                if abs(move_bps) >= float(latency_cfg["trigger_bps"]):
-                    await self.opportunity_scan(binance_ts=ts, binance_price=price, move_bps=move_bps)
+                d = await self.decide_entry(move_bps=move_bps, binance_price=price)
+                if not d:
+                    continue
+
+                trade_id = await self.execute_entry(d)
+                if trade_id:
+                    self._entry_ts_by_trade[trade_id] = now_ts()
 
         except asyncio.CancelledError:
             pass
@@ -383,316 +485,17 @@ class App:
             self._shutdown = True
             monitor_task.cancel()
 
-    async def opportunity_scan(self, binance_ts: int, binance_price: float, move_bps: float) -> None:
-        # Budget checks
-        if self.db.get_today_trade_count(self.mode) >= int(self.cfg["budget"]["max_trades_per_day"]):
-            return
-
-        # Only scan watchlist markets (bounded)
-        candidates: List[TradeCandidate] = []
-        latency_cfg = self.cfg["signals"]["latency"]
-        exec_cfg = self.cfg["execution"]
-        elig = self.cfg["watchlist"]["eligibility"]
-
-        side_hint = choose_side_from_binance_move(move_bps)
-
-        # Optional whale confirmation: only fetch if we have at least one candidate
-        whales_needed = bool(self.cfg["signals"]["whales"]["enabled"])
-
-        for market_id in self.watchlist:
-            # Read midpoint (cheap)
-            mid = await self.polymarket.get_midpoint(market_id)
-            if mid is None:
-                continue
-
-            last_mid, last_ts = self.last_polymarket_mid.get(market_id, (mid, binance_ts))
-            self.last_polymarket_mid[market_id] = (mid, binance_ts)
-
-            stale_seconds = max(0.0, (binance_ts - last_ts))
-            if stale_seconds < float(latency_cfg["stale_price_seconds"]):
-                continue
-
-            # Book for spread + top-of-book liquidity proxy
-            book = await self.polymarket.get_top_of_book(market_id)
-            if not book:
-                continue
-
-            best_bid = float(book["best_bid"])
-            best_ask = float(book["best_ask"])
-
-            spread_cents, cost_cents = estimate_costs_cents(
-                price_mid=mid,
-                best_bid=best_bid,
-                best_ask=best_ask,
-                fee_rate=float(self.cfg["fees"]["fallback_taker_fee_rate"]),
-                slippage_buffer_cents=float(exec_cfg["slippage_buffer_cents"]),
-            )
-
-            # Use cached liquidity from watchlist refresh; if missing, skip
-            liq = float(self.watchlist.meta.get(market_id, {}).get("liquidity_usd", 0.0))
-            if liq < float(elig["min_liquidity_usd"]):
-                continue
-            if spread_cents > float(elig["max_spread_cents"]):
-                continue
-
-            # Minimal edge estimate: convert move_bps into "edge cents"
-            # Codex: replace with your actual probability mapping model.
-            edge_cents = max(0.0, (abs(move_bps) / 10.0))  # heuristic: 20 bps => 2.0 "cents"
-            edge_after_costs = edge_cents - cost_cents
-            if edge_after_costs < float(exec_cfg["min_edge_after_costs_cents"]):
-                continue
-
-            score = float(latency_cfg["confidence_min"]) + min(1.0, abs(move_bps) / 100.0)
-
-            candidate = TradeCandidate(
-                market_id=market_id,
-                side=side_hint,
-                qty=self.compute_qty(liquidity_usd=liq),
-                price_ref=mid,
-                score=score,
-                edge_cents_est=edge_cents,
-                cost_cents_est=cost_cents,
-                liquidity_usd=liq,
-                spread_cents=spread_cents,
-                stale_seconds=stale_seconds,
-                strategy="latency",
-                meta={"binance_ts": binance_ts, "binance_price": binance_price, "move_bps": move_bps},
-            )
-            candidates.append(candidate)
-
-        if not candidates:
-            return
-
-        # Optional: whale confirmation (single polyscan call) then rescore
-        if whales_needed:
-            candidates = await self.apply_whale_confirmation(candidates)
-
-        # Pick best candidate
-        best = sorted(candidates, key=lambda c: c.score, reverse=True)[0]
-
-        # Risk checks and execute
-        if not self.risk_check(best):
-            return
-        await self.execute(best)
-
-    def compute_qty(self, liquidity_usd: float) -> float:
-        """
-        Conservative position sizing:
-        - cap at max_position_pct_of_liquidity * liquidity_usd
-        - convert to qty in "shares" or contracts depending on your execution model
-        """
-        cap_pct = float(self.cfg["watchlist"]["eligibility"]["max_position_pct_of_liquidity"])
-        notional_cap = max(0.0, liquidity_usd * cap_pct)
-        # Placeholder: 1 qty == 1 USDC notional-ish. Codex should map properly.
-        return max(1.0, min(notional_cap, 500.0))
-
-    async def apply_whale_confirmation(self, candidates: List[TradeCandidate]) -> List[TradeCandidate]:
-        whales_cfg = self.cfg["signals"]["whales"]
-        since = now_ts() - int(whales_cfg["confirm_window_seconds"])
-
-        try:
-            whales = await self.polyscan.recent_whales(since_ts=since)
-        except Exception as e:
-            print(f"[WHALES] fetch failed: {e}")
-            return candidates
-
-        # Index whales by market for quick lookup
-        whales_by_market: Dict[str, List[Dict[str, Any]]] = {}
-        for w in whales:
-            m = w.get("market_id")
-            if not m:
-                continue
-            whales_by_market.setdefault(m, []).append(w)
-
-        out: List[TradeCandidate] = []
-        for c in candidates:
-            confirmations = whales_by_market.get(c.market_id, [])
-            confirmed = False
-
-            for w in confirmations:
-                tier = (w.get("tier") or "").lower()
-                amt = float(w.get("amount_usd", 0.0) or 0.0)
-                side = (w.get("side") or "").upper()
-
-                if tier not in [t.lower() for t in whales_cfg["tier_allowlist"]]:
-                    continue
-                if amt < float(whales_cfg["min_amount_usd"]):
-                    continue
-                # Direction alignment (placeholder: YES/NO)
-                if side and side == c.side:
-                    confirmed = True
-                    self.db.record_whale_touch(
-                        ts=now_ts(),
-                        market_id=c.market_id,
-                        wallet=w.get("wallet"),
-                        side=side,
-                        amount_usd=amt,
-                        tier=tier,
-                        anomaly_tags=json.dumps(w.get("anomaly_tags", [])),
-                        used_as_confirmation=1,
-                    )
-                    break
-
-            if confirmed:
-                c.score += 0.25
-                c.strategy = "latency+whale"
-            out.append(c)
-
-        return out
-
-    def risk_check(self, c: TradeCandidate) -> bool:
-        if self.kill.is_paused():
-            return False
-
-        # Exit-failure safeguard
-        exit_failures = self.db.get_exit_failure_count_today(self.mode)
-        if exit_failures >= int(self.cfg["risk"]["kill_switch"]["max_consecutive_exit_failures"]):
-            self.kill.trigger_pause("Too many exit failures today")
-            return False
-
-        # Liquidity concentration check
-        max_pct = float(self.cfg["watchlist"]["eligibility"]["max_position_pct_of_liquidity"])
-        # qty mapping is placeholder; enforce notional cap broadly
-        if c.qty > (c.liquidity_usd * max_pct):
-            return False
-
-        return True
-
-    async def execute(self, c: TradeCandidate) -> None:
-        trade_id = str(uuid.uuid4())
-        ts_entry = now_ts()
-
-        # Record entry trade and snapshot
-        self.db.record_trade(
-            trade_id=trade_id,
-            ts_entry=ts_entry,
-            mode=self.mode,
-            strategy=c.strategy,
-            market_id=c.market_id,
-            side=c.side,
-            qty=c.qty,
-            price_entry=c.price_ref,
-            fees_estimated=c.cost_cents_est / 100.0,  # placeholder conversion
-            notes=json.dumps(c.meta),
-        )
-        self.db.record_trade_snapshot(
-            trade_id=trade_id,
-            ts=ts_entry,
-            phase="ENTRY",
-            binance_price=c.meta.get("binance_price"),
-            polymarket_mid=c.price_ref,
-            best_bid=c.price_ref - (c.spread_cents / 2.0),
-            best_ask=c.price_ref + (c.spread_cents / 2.0),
-            spread_cents=c.spread_cents,
-            liquidity_usd=c.liquidity_usd,
-            stale_seconds=c.stale_seconds,
-            edge_cents_est=c.edge_cents_est,
-            cost_cents_est=c.cost_cents_est,
-        )
-
-        # Paper / Arena / Live execution is abstracted.
-        # For now, we assume fill at reference midpoint.
-        # Codex: wire to paper_trader or arena_trader implementations.
-        position = Position(
-            trade_id=trade_id,
-            market_id=c.market_id,
-            side=c.side,
-            qty=c.qty,
-            entry_price=c.price_ref,
-            ts_entry=ts_entry,
-            strategy=c.strategy,
-            target_edge_cents=float(self.cfg["execution"]["min_edge_after_costs_cents"]),
-            max_hold_seconds=300,  # 5 min default; tune per market
-            meta=c.meta,
-        )
-        self.open_positions[trade_id] = position
-        print(f"[TRADE] Entered {trade_id} {c.strategy} {c.market_id} side={c.side} qty={c.qty} @ {c.price_ref:.2f}")
-
-    async def position_monitor_loop(self) -> None:
-        """
-        Monitor open positions only (cheap). No Polyscan calls here.
-        """
+    async def monitor_loop(self) -> None:
+        poll_seconds = float(self.cfg.get("monitoring", {}).get("poll_seconds", 2.0))
         while not self._shutdown:
             try:
-                await asyncio.sleep(2.0)
-                if not self.open_positions:
-                    continue
-
-                to_close: List[str] = []
-                for trade_id, pos in list(self.open_positions.items()):
-                    # Timeout exit
-                    age = now_ts() - pos.ts_entry
-                    if age > pos.max_hold_seconds:
-                        exit_reason = "timeout"
-                        ok = await self.exit_position(pos, exit_reason)
-                        if ok:
-                            to_close.append(trade_id)
-                        continue
-
-                    # Check current mid/book for exit edge
-                    mid = await self.polymarket.get_midpoint(pos.market_id)
-                    if mid is None:
-                        continue
-
-                    # Simple profit target: mid moved favorably by target_edge_cents
-                    favorable = (mid - pos.entry_price) if pos.side == "YES" else (pos.entry_price - mid)
-                    if favorable >= (pos.target_edge_cents / 1.0):
-                        exit_reason = "target"
-                        ok = await self.exit_position(pos, exit_reason)
-                        if ok:
-                            to_close.append(trade_id)
-
-                for tid in to_close:
-                    self.open_positions.pop(tid, None)
-
+                await asyncio.sleep(poll_seconds)
+                await self.maybe_exit_positions()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 print(f"[MONITOR] error: {e}")
 
-    async def exit_position(self, pos: Position, exit_reason: str) -> bool:
-        ts_exit = now_ts()
-        mid = await self.polymarket.get_midpoint(pos.market_id)
-        if mid is None:
-            # count as exit failure
-            self.kill.trigger_pause("Exit failed: no midpoint")
-            return False
-
-        # Simulated exit at midpoint
-        pnl = (mid - pos.entry_price) * pos.qty if pos.side == "YES" else (pos.entry_price - mid) * pos.qty
-
-        self.db.record_trade(
-            trade_id=pos.trade_id,
-            ts_exit=ts_exit,
-            price_exit=mid,
-            pnl=pnl,
-            outcome="WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "FLAT"),
-            exit_reason=exit_reason,
-        )
-        self.db.record_trade_snapshot(
-            trade_id=pos.trade_id,
-            ts=ts_exit,
-            phase="EXIT",
-            binance_price=None,
-            polymarket_mid=mid,
-            best_bid=None,
-            best_ask=None,
-            spread_cents=None,
-            liquidity_usd=None,
-            stale_seconds=None,
-            edge_cents_est=None,
-            cost_cents_est=None,
-        )
-        print(f"[TRADE] Exited {pos.trade_id} reason={exit_reason} @ {mid:.2f} pnl={pnl:.4f}")
-        return True
-
-    def request_shutdown(self) -> None:
-        self._shutdown = True
-
-
-# -----------------------------
-# Entrypoint
-# -----------------------------
 
 async def main_async() -> None:
     cfg = load_config("config/config.yaml")
@@ -709,7 +512,6 @@ async def main_async() -> None:
         try:
             loop.add_signal_handler(s, _handle_sig)
         except NotImplementedError:
-            # Windows may not support add_signal_handler for SIGTERM in some setups
             signal.signal(s, lambda *_: _handle_sig())
 
     await app.run()

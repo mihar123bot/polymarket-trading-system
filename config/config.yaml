@@ -10,17 +10,17 @@ watchlist:
   categories: ["crypto"]
   market_search:
     keywords: ["bitcoin", "btc"]
-    refresh_seconds: 60
+    refresh_seconds: 15
   eligibility:
-    min_liquidity_usd: 5000
+    min_liquidity_usd: 8000
     max_spread_cents: 5
     max_position_pct_of_liquidity: 0.02
-  mode: "arena"
+    min_seconds_to_close: 120
 
 signals:
   latency:
     window_seconds: 10
-    trigger_bps: 20
+    trigger_bps: 5
     stale_price_seconds: 2
     confidence_min: 0.5
   whales:
@@ -36,15 +36,20 @@ risk:
     pause_minutes_on_trigger: 15
 
 budget:
-  max_watchlist_markets: 10
+  max_watchlist_markets: 8
   max_trades_per_day: 50
 
 fees:
   fallback_taker_fee_rate: 0.02
 
 execution:
+  default_buy_usd: 1
+  max_buy_usd: 10
   slippage_buffer_cents: 0.2
   min_edge_after_costs_cents: 1.0
+  take_profit_usd: 0.05
+  stop_loss_usd: 0.05
+  max_hold_seconds: 120
 
 polyscan:
   base_url: "https://gzydspfquuaudqeztorw.supabase.co/functions/v1/agent-api"
@@ -56,25 +61,6 @@ polyscan:
 storage:
   db_path: "storage/polymarket.db"
   schema_path: "storage/schema.sql"
-    trigger_bps: 5
-
-budget:
-  max_watchlist_markets: 8
-  max_trades_per_day: 50
-
-execution:
-  default_buy_usd: 1
-  max_buy_usd: 10
-  take_profit_usd: 0.05
-  stop_loss_usd: 0.05
-  max_hold_seconds: 120
-
-watchlist:
-  market_search:
-    refresh_seconds: 15
-  eligibility:
-    min_liquidity_usd: 8000
-    min_seconds_to_close: 120
 
 monitoring:
   poll_seconds: 2

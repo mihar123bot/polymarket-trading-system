@@ -51,13 +51,13 @@ class CircuitBreakerState:
 class PolyscanClient:
     def __init__(
         self,
-        base_url: str,
-        agent_id: str,
+        base_url: str = "",
+        agent_id: str = "",
         timeout_s: int = 15,
         cache_ttl_markets_s: int = 15,
         cache_ttl_market_detail_s: int = 10,
     ):
-        self.base_url = base_url.rstrip("/")
+        self.base_url = base_url.rstrip("/") if base_url else ""
         self.agent_id = agent_id
         self.timeout = aiohttp.ClientTimeout(total=timeout_s)
 
@@ -95,12 +95,9 @@ class PolyscanClient:
         if self._breaker.is_open():
             raise RuntimeError(f"Polyscan circuit open until {self._breaker.open_until:.0f}")
 
-        # Always include agent_id
         params = dict(params)
         params["agent_id"] = self.agent_id
 
-        # Polyscan uses action-style query parameters
-        # Endpoint is base_url itself (no /search etc)
         url = self.base_url
 
         sess = await self._get_session()
@@ -125,14 +122,10 @@ class PolyscanClient:
         except Exception:
             return default
 
-from typing import Any, Dict, List
-
-
-class PolyscanClient:
     async def list_markets(
         self,
-        category: str,
-        limit: int,
+        category: str = "",
+        limit: int = 100,
         sort: str = "created_at",
         order: str = "desc",
         offset: int = 0,
@@ -223,5 +216,3 @@ class PolyscanClient:
     async def ai_vs_humans(self, limit: int = 50) -> List[Dict[str, Any]]:
         data = await self._get_json({"action": "ai-vs-humans", "limit": int(limit)})
         return data.get("data", []) or []
-    ) -> List[Dict[str, Any]]:
-        raise NotImplementedError("Implement Polyscan action=markets client in collectors/polyscan_collector.py")

@@ -15,6 +15,13 @@ if "yaml" not in sys.modules:
     yaml_stub.safe_load = lambda *_args, **_kwargs: {}
     sys.modules["yaml"] = yaml_stub
 
+# Stub aiohttp if not installed
+if "aiohttp" not in sys.modules:
+    aiohttp_stub = types.ModuleType("aiohttp")
+    aiohttp_stub.ClientSession = type("ClientSession", (), {})
+    aiohttp_stub.ClientTimeout = lambda **kw: None
+    sys.modules["aiohttp"] = aiohttp_stub
+
 from main import App
 
 

@@ -213,6 +213,18 @@ class PolyscanClient:
         data = await self._get_json({"action": "whales", "limit": int(limit)})
         return data.get("data", []) or []
 
+    async def search(self, q: str, limit: int = 50) -> List[Dict[str, Any]]:
+        data = await self._get_json({"action": "search", "q": q, "limit": int(limit)})
+        return data.get("data", []) or []
+
     async def ai_vs_humans(self, limit: int = 50) -> List[Dict[str, Any]]:
         data = await self._get_json({"action": "ai-vs-humans", "limit": int(limit)})
         return data.get("data", []) or []
+
+    async def categories(self) -> List[Dict[str, Any]]:
+        data = await self._get_json({"action": "categories"})
+        return data.get("data", []) or []
+
+    async def stats(self) -> Dict[str, Any]:
+        data = await self._get_json({"action": "stats"})
+        return data.get("data", {}) or {}

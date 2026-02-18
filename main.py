@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import signal
 import time
 import uuid
@@ -181,6 +182,11 @@ class App:
         self._cached_portfolio: Optional[Dict[str, Any]] = None
 
     async def init(self) -> None:
+        print(
+            f"[STARTUP] mode={self.mode} "
+            f"db_path={os.path.abspath(self.db.path)} "
+            f"schema_path={os.path.abspath(self.db.schema_path)}"
+        )
         self.db.init_schema()
         await self.refresh_watchlist(force=True)
 

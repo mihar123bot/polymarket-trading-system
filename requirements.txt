@@ -2,3 +2,11 @@ pyyaml
 aiohttp
 websockets
 pytest
+
+streamlit
+plotly
+yfinance
+hmmlearn
+numpy
+pandas
+scikit-learn
